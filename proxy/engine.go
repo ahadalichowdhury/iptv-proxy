@@ -194,7 +194,7 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 		return
 	}
 
-	body, status, err := e.fetchUpstream(r, targetURL, auth)
+	body, status, sessionAuth, err := e.fetchUpstream(r, targetURL, auth)
 	if err != nil {
 		log.Printf("manifest fetch error url=%s err=%v", targetURL, err)
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -209,14 +209,17 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 		return
 	}
 
-	rewritten, err := e.rewriteManifest(body, targetURL, auth)
+	effectiveAuth := utils.MergeAuth(auth, sessionAuth)
+	rewritten, err := e.rewriteManifest(body, targetURL, effectiveAuth)
 	if err != nil {
 		log.Printf("manifest rewrite error url=%s err=%v", targetURL, err)
 		http.Error(w, "manifest rewrite failed", http.StatusBadGateway)
 		return
 	}
 
-	e.setCache(key, rewritten)
+	if status >= 200 && status < 300 {
+		e.setCache(key, rewritten)
+	}
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -262,28 +265,30 @@ func (e *Engine) streamBinary(w http.ResponseWriter, r *http.Request, targetURL,
 	}
 }
 
-func (e *Engine) fetchUpstream(r *http.Request, targetURL, auth string) ([]byte, int, error) {
+func (e *Engine) fetchUpstream(r *http.Request, targetURL, auth string) ([]byte, int, string, error) {
 	resp, cancel, err := e.doUpstream(r, targetURL, auth, upstreamManifest)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, "", err
 	}
 	defer cancel()
 	defer resp.Body.Close()
 
+	sessionAuth := utils.SessionAuthFromHeaders(resp.Header)
+
 	if resp.ContentLength > e.maxManifestSize {
-		return nil, 0, fmt.Errorf("manifest content-length %d exceeds limit %d", resp.ContentLength, e.maxManifestSize)
+		return nil, 0, sessionAuth, fmt.Errorf("manifest content-length %d exceeds limit %d", resp.ContentLength, e.maxManifestSize)
 	}
 
 	limited := io.LimitReader(resp.Body, e.maxManifestSize+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, sessionAuth, err
 	}
 	if int64(len(body)) > e.maxManifestSize {
-		return nil, 0, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
+		return nil, 0, sessionAuth, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
 	}
 
-	return body, resp.StatusCode, nil
+	return body, resp.StatusCode, sessionAuth, nil
 }
 
 func (e *Engine) doUpstream(r *http.Request, targetURL, auth string, kind upstreamKind) (*http.Response, context.CancelFunc, error) {

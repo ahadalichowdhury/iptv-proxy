@@ -69,6 +69,15 @@ func applyAuthHeaders(h http.Header, auth string) {
 		return
 	}
 
+	if key, value, ok := strings.Cut(auth, ":"); ok {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			h.Set(key, value)
+			return
+		}
+	}
+
 	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		h.Set("Authorization", auth)
 		return
