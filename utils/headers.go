@@ -2,114 +2,178 @@ package utils
 
 import (
 	"net/http"
-	"net/url"
 	"strings"
 )
 
-// BrowserUserAgent is sent to upstream sources that expect a browser client.
+// BrowserUserAgent is used for sources that explicitly expect a desktop browser.
 const BrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-// HeadersForURL builds upstream request headers from the target URL and optional auth token.
-// auth may be a bare token (Authorization: Bearer ...) or "Key: Value" pairs separated by "|".
+// NSPlayerUserAgent mimics Network Stream Player's default Android client fingerprint
+// when the playlist does not supply Referer, Origin, or Cookie.
+const NSPlayerUserAgent = "Dalvik/2.1.0 (Linux; U; Android 13; SM-A037F Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.45 Mobile Safari/537.36"
+
+// UpstreamHeaderOptions tunes header generation for manifests vs media segments.
+type UpstreamHeaderOptions struct {
+	// MediaSegment is true for TS/fMP4/AAC segment fetches (not master/media playlists).
+	MediaSegment bool
+}
+
+// HeadersForURL builds upstream request headers using the NS Player profile by default.
 func HeadersForURL(rawURL, auth string) http.Header {
+	return HeadersForUpstream(rawURL, auth, UpstreamHeaderOptions{})
+}
+
+// HeadersForUpstream builds upstream headers.
+//
+// Profile selection:
+//   - Explicit playlist: auth contains Referer, Origin, and/or Cookie → send those exactly.
+//   - NS Player default: no Referer/Origin/Cookie → Dalvik UA, identity encoding, no Referer/Origin.
+func HeadersForUpstream(rawURL, auth string, opts UpstreamHeaderOptions) http.Header {
+	authHeaders := ParseAuthHeaderMap(auth)
+	if HasExplicitStreamIdentity(authHeaders) {
+		return buildExplicitPlaylistHeaders(rawURL, authHeaders, opts)
+	}
+	return buildNSPlayerHeaders(rawURL, authHeaders, opts)
+}
+
+// HasExplicitStreamIdentity reports whether the source supplied identity headers
+// that must be forwarded verbatim (IPTV playlist / NS Player manual fields).
+func HasExplicitStreamIdentity(authHeaders map[string]string) bool {
+	for key := range authHeaders {
+		switch CanonicalHeaderName(key) {
+		case "Referer", "Origin", "Cookie":
+			return true
+		}
+	}
+	return false
+}
+
+func buildNSPlayerHeaders(rawURL string, auth map[string]string, opts UpstreamHeaderOptions) http.Header {
 	h := make(http.Header)
 
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return h
+	if ua := strings.TrimSpace(auth["User-Agent"]); ua != "" {
+		h.Set("User-Agent", ua)
+	} else {
+		h.Set("User-Agent", NSPlayerUserAgent)
 	}
 
-	scheme := parsed.Scheme
-	if scheme == "" {
-		scheme = "https"
-	}
-
-	host := parsed.Hostname()
-	origin := scheme + "://" + host
-	if port := parsed.Port(); port != "" {
-		origin = scheme + "://" + host + ":" + port
-	}
-
-	referer := origin + "/"
-	if parsed.Path != "" && parsed.Path != "/" {
-		referer = scheme + "://" + parsed.Host + parsed.Path
-	}
-
-	h.Set("User-Agent", BrowserUserAgent)
-	h.Set("Origin", origin)
-	h.Set("Referer", referer)
+	h.Set("Accept-Encoding", "identity")
 	h.Set("Accept", "*/*")
-	h.Set("Accept-Language", "en-US,en;q=0.9")
 	h.Set("Connection", "keep-alive")
 
-	applyAuthHeaders(h, auth)
-	applyDomainOverrides(h, host, origin, referer)
+	applyAuthHeadersExcept(h, auth, "User-Agent")
+
+	if shouldSendIcyMetadata(rawURL, auth, opts) {
+		if h.Get("Icy-MetaData") == "" {
+			h.Set("Icy-MetaData", "1")
+		}
+	}
 
 	return h
 }
 
-func applyAuthHeaders(h http.Header, auth string) {
-	auth = strings.TrimSpace(auth)
-	if auth == "" {
-		return
-	}
+func buildExplicitPlaylistHeaders(rawURL string, auth map[string]string, opts UpstreamHeaderOptions) http.Header {
+	h := make(http.Header)
 
-	if strings.Contains(auth, "|") {
-		for _, part := range strings.Split(auth, "|") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			key, value, ok := strings.Cut(part, ":")
-			if !ok {
-				continue
-			}
-			h.Set(strings.TrimSpace(key), strings.TrimSpace(value))
-		}
-		return
-	}
-
-	if key, value, ok := strings.Cut(auth, ":"); ok {
-		key = strings.TrimSpace(key)
+	for key, value := range auth {
 		value = strings.TrimSpace(value)
-		if key != "" && value != "" {
-			h.Set(key, value)
-			return
+		if value == "" {
+			continue
 		}
+		h.Set(CanonicalHeaderName(key), value)
 	}
 
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		h.Set("Authorization", auth)
-		return
+	if h.Get("User-Agent") == "" {
+		h.Set("User-Agent", NSPlayerUserAgent)
+	}
+	if h.Get("Accept-Encoding") == "" {
+		h.Set("Accept-Encoding", "identity")
+	}
+	if h.Get("Accept") == "" {
+		h.Set("Accept", "*/*")
+	}
+	if h.Get("Connection") == "" {
+		h.Set("Connection", "keep-alive")
 	}
 
-	h.Set("Authorization", "Bearer "+auth)
+	if shouldSendIcyMetadata(rawURL, auth, opts) && h.Get("Icy-MetaData") == "" {
+		h.Set("Icy-MetaData", "1")
+	}
+
+	return h
 }
 
-func applyDomainOverrides(h http.Header, host, origin, referer string) {
-	host = strings.ToLower(host)
+func applyAuthHeadersExcept(h http.Header, auth map[string]string, skipKeys ...string) {
+	skip := make(map[string]struct{}, len(skipKeys))
+	for _, key := range skipKeys {
+		skip[CanonicalHeaderName(key)] = struct{}{}
+	}
 
-	switch {
-	case strings.Contains(host, "youtube.com"), strings.Contains(host, "googlevideo.com"):
-		h.Set("Origin", "https://www.youtube.com")
-		h.Set("Referer", "https://www.youtube.com/")
+	for key, value := range auth {
+		canonical := CanonicalHeaderName(key)
+		if _, omitted := skip[canonical]; omitted {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		h.Set(canonical, value)
+	}
+}
 
-	case strings.Contains(host, "twitch.tv"), strings.Contains(host, "ttvnw.net"):
-		h.Set("Origin", "https://www.twitch.tv")
-		h.Set("Referer", "https://www.twitch.tv/")
+func shouldSendIcyMetadata(rawURL string, auth map[string]string, opts UpstreamHeaderOptions) bool {
+	if strings.TrimSpace(auth["Icy-MetaData"]) != "" {
+		return true
+	}
 
-	case strings.Contains(host, "dailymotion.com"), strings.Contains(host, "dmcdn.net"):
-		h.Set("Origin", "https://www.dailymotion.com")
-		h.Set("Referer", "https://www.dailymotion.com/")
+	lower := strings.ToLower(rawURL)
+	if strings.Contains(lower, ".ts") || strings.Contains(lower, "mp2t") {
+		return true
+	}
+	if opts.MediaSegment && (strings.Contains(lower, "/live/") || strings.Contains(lower, "/hls/")) {
+		return true
+	}
+	return strings.Contains(lower, "icy") || strings.Contains(lower, "shoutcast")
+}
 
-	case strings.Contains(host, "facebook.com"), strings.Contains(host, "fbcdn.net"):
-		h.Set("Origin", "https://www.facebook.com")
-		h.Set("Referer", "https://www.facebook.com/")
+func CanonicalHeaderName(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
 
+	switch strings.ToLower(key) {
+	case "referer", "referrer":
+		return "Referer"
+	case "user-agent", "useragent":
+		return "User-Agent"
+	case "origin":
+		return "Origin"
+	case "cookie":
+		return "Cookie"
+	case "authorization":
+		return "Authorization"
+	case "icy-metadata":
+		return "Icy-MetaData"
+	case "accept-encoding":
+		return "Accept-Encoding"
 	default:
-		// Keep computed origin/referer for generic IPTV/CDN hosts.
-		h.Set("Origin", origin)
-		h.Set("Referer", referer)
+		return http.CanonicalHeaderKey(key)
+	}
+}
+
+// ParseAuthHeaderMap parses pipe-delimited auth into a header map.
+func ParseAuthHeaderMap(auth string) map[string]string {
+	return parseAuthPairs(auth)
+}
+
+func applyAuthHeaders(h http.Header, auth string) {
+	for key, value := range ParseAuthHeaderMap(auth) {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		h.Set(CanonicalHeaderName(key), value)
 	}
 }
 

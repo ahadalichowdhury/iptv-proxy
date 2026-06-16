@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"sync"
@@ -20,11 +21,13 @@ import (
 )
 
 const (
-	defaultMaxConcurrent  = 1000
-	defaultManifestTimeout = 30 * time.Second
+	defaultMaxConcurrent    = 1000
+	defaultManifestTimeout  = 30 * time.Second
 	defaultMaxManifestSize  = 1 << 20 // 1 MiB
 	defaultMaxManifestLine  = 1 << 20 // 1 MiB per line
-	cacheTTL                = 5 * time.Minute
+	defaultMaxRedirectHops  = 10
+	masterPlaylistCacheTTL  = 2 * time.Minute
+	vodPlaylistCacheTTL     = 5 * time.Minute
 )
 
 var errManifestLineTooLong = errors.New("manifest line exceeds buffer limit")
@@ -108,12 +111,19 @@ func (e *Engine) Shutdown() {
 	e.client.CloseIdleConnections()
 }
 
-// HandleStream is the HTTP handler for GET /proxy?url=...&auth=...
+// HandleStream is the HTTP handler for /proxy?url=...&auth=...
 func (e *Engine) HandleStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		e.handleStreamGet(w, r)
+	case http.MethodPost:
+		e.handleStreamPost(w, r)
+	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
 	}
+}
+
+func (e *Engine) handleStreamGet(w http.ResponseWriter, r *http.Request) {
 
 	targetURL := strings.TrimSpace(r.URL.Query().Get("url"))
 	if targetURL == "" {
@@ -121,12 +131,21 @@ func (e *Engine) HandleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	auth := r.URL.Query().Get("auth")
+	if pipeURL, pipeAuth := utils.ParseStreamSource(targetURL); pipeAuth != "" || pipeURL != targetURL {
+		targetURL = pipeURL
+		auth = utils.MergeAuth(pipeAuth, auth)
+	}
+
 	if _, err := url.ParseRequestURI(targetURL); err != nil {
 		http.Error(w, "invalid url parameter", http.StatusBadRequest)
 		return
 	}
 
-	auth := r.URL.Query().Get("auth")
+	if !isUpstreamHTTPURL(targetURL) {
+		http.Error(w, "url must use http or https", http.StatusBadRequest)
+		return
+	}
 
 	if err := e.acquire(r.Context()); err != nil {
 		http.Error(w, "server at capacity, try again later", http.StatusServiceUnavailable)
@@ -134,12 +153,104 @@ func (e *Engine) HandleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer e.release()
 
-	if e.isManifest(targetURL) {
-		e.serveManifest(w, r, targetURL, auth)
+	if e.isHLSManifestURL(targetURL) {
+		e.serveHLSManifest(w, r, targetURL, auth)
+		return
+	}
+
+	if isDashManifestURL(targetURL) {
+		e.serveDashManifest(w, r, targetURL, auth)
 		return
 	}
 
 	e.streamBinary(w, r, targetURL, auth)
+}
+
+func (e *Engine) handleStreamPost(w http.ResponseWriter, r *http.Request) {
+	targetURL := strings.TrimSpace(r.URL.Query().Get("url"))
+	if targetURL == "" {
+		http.Error(w, "missing required query parameter: url", http.StatusBadRequest)
+		return
+	}
+
+	auth := r.URL.Query().Get("auth")
+	if pipeURL, pipeAuth := utils.ParseStreamSource(targetURL); pipeAuth != "" || pipeURL != targetURL {
+		targetURL = pipeURL
+		auth = utils.MergeAuth(pipeAuth, auth)
+	}
+
+	if _, err := url.ParseRequestURI(targetURL); err != nil {
+		http.Error(w, "invalid url parameter", http.StatusBadRequest)
+		return
+	}
+
+	if !isUpstreamHTTPURL(targetURL) {
+		http.Error(w, "url must use http or https", http.StatusBadRequest)
+		return
+	}
+
+	if err := e.acquire(r.Context()); err != nil {
+		http.Error(w, "server at capacity, try again later", http.StatusServiceUnavailable)
+		return
+	}
+	defer e.release()
+
+	e.proxyPost(w, r, targetURL, auth)
+}
+
+func (e *Engine) proxyPost(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
+	upstreamAuth := utils.StripDrmAuth(auth)
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), e.manifestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "failed to create upstream request", http.StatusBadGateway)
+		return
+	}
+
+	for k, values := range utils.HeadersForURL(targetURL, upstreamAuth) {
+		for _, v := range values {
+			req.Header.Add(k, v)
+		}
+	}
+
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		req.Header.Set("Content-Type", ct)
+	} else {
+		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+
+	client := e.clientForUpstream()
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Printf("license upstream error url=%s err=%v", targetURL, err)
+		http.Error(w, "upstream license request failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	copyHeaders(w, resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	if r.Method != http.MethodHead && resp.Body != nil {
+		_, _ = io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+	}
+}
+
+func (e *Engine) isHLSManifestURL(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	return strings.Contains(lower, ".m3u8") || strings.Contains(lower, "mpegurl")
 }
 
 func (e *Engine) acquire(ctx context.Context) error {
@@ -153,11 +264,6 @@ func (e *Engine) acquire(ctx context.Context) error {
 
 func (e *Engine) release() {
 	<-e.sem
-}
-
-func (e *Engine) isManifest(rawURL string) bool {
-	lower := strings.ToLower(rawURL)
-	return strings.Contains(lower, ".m3u8") || strings.Contains(lower, "mpegurl")
 }
 
 func (e *Engine) cacheKey(targetURL, auth string) string {
@@ -175,14 +281,81 @@ func (e *Engine) getCached(key string) ([]byte, bool) {
 	return nil, false
 }
 
-func (e *Engine) setCache(key string, data []byte) {
+func (e *Engine) setCache(key string, data []byte, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
 	e.cache.Store(key, cacheEntry{
 		data:      data,
-		expiresAt: time.Now().Add(cacheTTL),
+		expiresAt: time.Now().Add(ttl),
 	})
 }
 
-func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
+func (e *Engine) serveDashManifest(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
+	key := e.cacheKey(targetURL, auth)
+	if data, ok := e.getCached(key); ok {
+		w.Header().Set("Content-Type", dashManifestContentType())
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(data)
+		}
+		return
+	}
+
+	body, status, sessionAuth, finalURL, err := e.fetchUpstream(r, targetURL, auth)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		log.Printf("dash manifest fetch error url=%s err=%v", targetURL, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "upstream manifest fetch timed out", http.StatusGatewayTimeout)
+			return
+		}
+		if strings.Contains(err.Error(), "exceeds limit") {
+			http.Error(w, "manifest payload too large", http.StatusBadGateway)
+			return
+		}
+		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	if status < 200 || status >= 300 {
+		log.Printf("dash manifest upstream rejected url=%s status=%d", targetURL, status)
+		writeUpstreamError(w, body, status)
+		return
+	}
+
+	if !isValidDashManifest(body) {
+		log.Printf("dash manifest invalid payload url=%s reason=missing_mpd", targetURL)
+		http.Error(w, "upstream response is not a valid DASH manifest", http.StatusBadGateway)
+		return
+	}
+
+	logUpstreamRedirect(targetURL, finalURL)
+
+	effectiveAuth := utils.MergeAuth(auth, sessionAuth)
+	rewritten, err := e.rewriteDashManifest(body, finalURL, effectiveAuth)
+	if err != nil {
+		log.Printf("dash manifest rewrite error url=%s err=%v", targetURL, err)
+		http.Error(w, "manifest rewrite failed", http.StatusBadGateway)
+		return
+	}
+
+	if dashManifestCacheAllowed(body) {
+		e.setCache(key, rewritten, vodPlaylistCacheTTL)
+	}
+
+	w.Header().Set("Content-Type", dashManifestContentType())
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(rewritten)
+	}
+}
+
+func (e *Engine) serveHLSManifest(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
 	key := e.cacheKey(targetURL, auth)
 	if data, ok := e.getCached(key); ok {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -194,8 +367,11 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 		return
 	}
 
-	body, status, sessionAuth, err := e.fetchUpstream(r, targetURL, auth)
+	body, status, sessionAuth, finalURL, err := e.fetchUpstream(r, targetURL, auth)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Printf("manifest fetch error url=%s err=%v", targetURL, err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			http.Error(w, "upstream manifest fetch timed out", http.StatusGatewayTimeout)
@@ -209,8 +385,22 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 		return
 	}
 
+	logUpstreamRedirect(targetURL, finalURL)
+
+	if status < 200 || status >= 300 {
+		log.Printf("manifest upstream rejected url=%s status=%d", targetURL, status)
+		writeUpstreamError(w, body, status)
+		return
+	}
+
+	if !isHLSManifest(body) {
+		log.Printf("manifest invalid payload url=%s reason=missing_extm3u", targetURL)
+		http.Error(w, "upstream response is not a valid HLS manifest", http.StatusBadGateway)
+		return
+	}
+
 	effectiveAuth := utils.MergeAuth(auth, sessionAuth)
-	rewritten, err := e.rewriteManifest(body, targetURL, effectiveAuth)
+	rewritten, err := e.rewriteManifest(body, finalURL, effectiveAuth)
 	if err != nil {
 		log.Printf("manifest rewrite error url=%s err=%v", targetURL, err)
 		http.Error(w, "manifest rewrite failed", http.StatusBadGateway)
@@ -218,11 +408,17 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 	}
 
 	if status >= 200 && status < 300 {
-		e.setCache(key, rewritten)
+		if cacheTTL, ok := manifestCacheTTL(body); ok {
+			e.setCache(key, rewritten, cacheTTL)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "no-cache")
+	if shouldBypassManifestCache(body) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 	w.WriteHeader(status)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(rewritten)
@@ -232,6 +428,9 @@ func (e *Engine) serveManifest(w http.ResponseWriter, r *http.Request, targetURL
 func (e *Engine) streamBinary(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
 	resp, cancel, err := e.doUpstream(r, targetURL, auth, upstreamStream)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		log.Printf("upstream error url=%s err=%v", targetURL, err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			http.Error(w, "upstream stream timed out", http.StatusGatewayTimeout)
@@ -265,30 +464,31 @@ func (e *Engine) streamBinary(w http.ResponseWriter, r *http.Request, targetURL,
 	}
 }
 
-func (e *Engine) fetchUpstream(r *http.Request, targetURL, auth string) ([]byte, int, string, error) {
+func (e *Engine) fetchUpstream(r *http.Request, targetURL, auth string) ([]byte, int, string, string, error) {
 	resp, cancel, err := e.doUpstream(r, targetURL, auth, upstreamManifest)
 	if err != nil {
-		return nil, 0, "", err
+		return nil, 0, "", targetURL, err
 	}
 	defer cancel()
 	defer resp.Body.Close()
 
+	finalURL := upstreamFinalURL(resp, targetURL)
 	sessionAuth := utils.SessionAuthFromHeaders(resp.Header)
 
 	if resp.ContentLength > e.maxManifestSize {
-		return nil, 0, sessionAuth, fmt.Errorf("manifest content-length %d exceeds limit %d", resp.ContentLength, e.maxManifestSize)
+		return nil, 0, sessionAuth, finalURL, fmt.Errorf("manifest content-length %d exceeds limit %d", resp.ContentLength, e.maxManifestSize)
 	}
 
 	limited := io.LimitReader(resp.Body, e.maxManifestSize+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, 0, sessionAuth, err
+		return nil, 0, sessionAuth, finalURL, err
 	}
 	if int64(len(body)) > e.maxManifestSize {
-		return nil, 0, sessionAuth, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
+		return nil, 0, sessionAuth, finalURL, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
 	}
 
-	return body, resp.StatusCode, sessionAuth, nil
+	return body, resp.StatusCode, sessionAuth, finalURL, nil
 }
 
 func (e *Engine) doUpstream(r *http.Request, targetURL, auth string, kind upstreamKind) (*http.Response, context.CancelFunc, error) {
@@ -300,7 +500,8 @@ func (e *Engine) doUpstream(r *http.Request, targetURL, auth string, kind upstre
 		return nil, nil, err
 	}
 
-	for k, values := range utils.HeadersForURL(targetURL, auth) {
+	upstreamAuth := utils.StripDrmAuth(auth)
+	for k, values := range utils.HeadersForURL(targetURL, upstreamAuth) {
 		for _, v := range values {
 			req.Header.Add(k, v)
 		}
@@ -310,13 +511,73 @@ func (e *Engine) doUpstream(r *http.Request, targetURL, auth string, kind upstre
 		req.Header.Set("Range", rng)
 	}
 
-	resp, err := e.client.Do(req)
+	client := e.clientForUpstream()
+	resp, err := client.Do(req)
 	if err != nil {
 		cancel()
 		return nil, nil, err
 	}
 
 	return resp, cancel, nil
+}
+
+// clientForUpstream returns an HTTP client scoped to a single upstream fetch.
+// Each client gets its own cookie jar so 302 redirect chains (Set-Cookie → tokenized URL)
+// work like NS Player, without leaking cookies across unrelated streams.
+func (e *Engine) clientForUpstream() *http.Client {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		jar = nil
+	}
+
+	return &http.Client{
+		Timeout:   e.client.Timeout,
+		Transport: e.client.Transport,
+		Jar:       jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= defaultMaxRedirectHops {
+				return fmt.Errorf("stopped after %d redirects", defaultMaxRedirectHops)
+			}
+			// Preserve NS/playlist headers across redirect hops (token gates often drop them).
+			if len(via) > 0 {
+				inheritRedirectHeaders(req, via[0])
+			}
+			return nil
+		},
+	}
+}
+
+func inheritRedirectHeaders(next, first *http.Request) {
+	for _, key := range []string{
+		"User-Agent",
+		"Referer",
+		"Origin",
+		"Cookie",
+		"Authorization",
+		"Accept-Encoding",
+		"Accept",
+		"Connection",
+		"Icy-MetaData",
+	} {
+		if next.Header.Get(key) != "" {
+			continue
+		}
+		if value := first.Header.Get(key); value != "" {
+			next.Header.Set(key, value)
+		}
+	}
+
+	for key, values := range first.Header {
+		if !strings.HasPrefix(key, "X-") {
+			continue
+		}
+		if next.Header.Get(key) != "" {
+			continue
+		}
+		for _, value := range values {
+			next.Header.Add(key, value)
+		}
+	}
 }
 
 func (e *Engine) upstreamContext(r *http.Request, kind upstreamKind) (context.Context, context.CancelFunc) {
@@ -547,4 +808,64 @@ func (e *Engine) ActiveStreams() int {
 // MaxConcurrent returns the configured concurrency limit.
 func (e *Engine) MaxConcurrent() int {
 	return e.maxConcurrent
+}
+
+// manifestCacheTTL decides whether a rewritten manifest may be cached.
+// Live media playlists must never be cached — they gain new segments continuously.
+func manifestCacheTTL(body []byte) (time.Duration, bool) {
+	content := string(body)
+
+	if strings.Contains(content, "#EXT-X-ENDLIST") {
+		return vodPlaylistCacheTTL, true
+	}
+
+	if strings.Contains(content, "#EXT-X-STREAM-INF:") && !strings.Contains(content, "#EXTINF:") {
+		return masterPlaylistCacheTTL, true
+	}
+
+	return 0, false
+}
+
+func shouldBypassManifestCache(body []byte) bool {
+	_, ok := manifestCacheTTL(body)
+	return !ok
+}
+
+func isHLSManifest(body []byte) bool {
+	trimmed := strings.TrimSpace(string(body))
+	return strings.HasPrefix(trimmed, "#EXTM3U")
+}
+
+func writeUpstreamError(w http.ResponseWriter, body []byte, status int) {
+	snippet := strings.TrimSpace(string(body))
+	if snippet == "" {
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
+	if len(snippet) > 512 {
+		snippet = snippet[:512]
+	}
+	http.Error(w, snippet, status)
+}
+
+func logUpstreamRedirect(requestedURL, finalURL string) {
+	if requestedURL == "" || finalURL == "" || requestedURL == finalURL {
+		return
+	}
+	log.Printf("upstream redirect requested=%s final=%s", requestedURL, finalURL)
+}
+
+func upstreamFinalURL(resp *http.Response, requestedURL string) string {
+	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String()
+	}
+	return requestedURL
+}
+
+func isUpstreamHTTPURL(raw string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
 }

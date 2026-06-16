@@ -45,34 +45,39 @@ func parseAuthPairs(auth string) map[string]string {
 		return map[string]string{}
 	}
 
-	if strings.Contains(auth, "|") {
-		out := make(map[string]string)
-		for _, part := range strings.Split(auth, "|") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			key, value, ok := strings.Cut(part, ":")
+	out := make(map[string]string)
+
+	appendPair := func(part string) {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return
+		}
+		for _, segment := range splitAuthSegments(part) {
+			key, value, ok := splitAuthPair(segment)
 			if !ok {
 				continue
 			}
-			out[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			out[CanonicalHeaderName(key)] = value
+		}
+	}
+
+	if strings.Contains(auth, "|") {
+		for _, part := range strings.Split(auth, "|") {
+			appendPair(part)
 		}
 		return out
 	}
 
-	if strings.Contains(auth, ":") {
-		key, value, ok := strings.Cut(auth, ":")
-		if ok {
-			return map[string]string{strings.TrimSpace(key): strings.TrimSpace(value)}
+	appendPair(auth)
+
+	if len(out) == 0 {
+		if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			return map[string]string{"Authorization": auth}
 		}
+		return map[string]string{"Authorization": "Bearer " + auth}
 	}
 
-	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
-		return map[string]string{"Authorization": auth}
-	}
-
-	return map[string]string{"Authorization": "Bearer " + auth}
+	return out
 }
 
 func formatAuthPairs(pairs map[string]string) string {
@@ -80,33 +85,41 @@ func formatAuthPairs(pairs map[string]string) string {
 		return ""
 	}
 
-	keys := make([]string, 0, len(pairs))
-	for key := range pairs {
-		keys = append(keys, key)
+	preferred := []string{
+		"Referer",
+		"Origin",
+		"User-Agent",
+		"Authorization",
+		"Cookie",
 	}
 
-	// Stable order: session headers first, then anything else sorted.
-	ordered := make([]string, 0, len(keys))
-	for _, preferred := range upstreamSessionHeaders {
-		if value, ok := pairs[preferred]; ok {
-			ordered = append(ordered, preferred+":"+value)
+	ordered := make([]string, 0, len(pairs))
+	seen := make(map[string]bool, len(pairs))
+
+	for _, preferredKey := range append(preferred, upstreamSessionHeaders...) {
+		canonical := CanonicalHeaderName(preferredKey)
+		if value, ok := pairs[canonical]; ok && !seen[canonical] {
+			ordered = append(ordered, canonical+":"+value)
+			seen[canonical] = true
+		}
+	}
+
+	keys := make([]string, 0, len(pairs))
+	for key := range pairs {
+		if !seen[key] {
+			keys = append(keys, key)
+		}
+	}
+	for i := 0; i < len(keys)-1; i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
 		}
 	}
 	for _, key := range keys {
-		if containsHeader(upstreamSessionHeaders, key) {
-			continue
-		}
 		ordered = append(ordered, key+":"+pairs[key])
 	}
 
 	return strings.Join(ordered, "|")
-}
-
-func containsHeader(headers []string, key string) bool {
-	for _, h := range headers {
-		if strings.EqualFold(h, key) {
-			return true
-		}
-	}
-	return false
 }

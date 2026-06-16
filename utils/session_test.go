@@ -34,7 +34,7 @@ func TestMergeAuth(t *testing.T) {
 
 	t.Run("preserves bearer and adds sid", func(t *testing.T) {
 		got := MergeAuth("my-token", "X-Sid:new-sid")
-		if got != "X-Sid:new-sid|Authorization:Bearer my-token" {
+		if got != "Authorization:Bearer my-token|X-Sid:new-sid" {
 			t.Fatalf("got %q", got)
 		}
 	})
