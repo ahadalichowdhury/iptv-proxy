@@ -17,7 +17,7 @@ func TestUpstreamFinalURLAfterRedirect(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	engine := NewEngine(10, "http://127.0.0.1:8080")
+	engine := NewEngine(10, "http://127.0.0.1:8080", "")
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/proxy?url="+upstream.URL+"/entry.m3u8", nil)
 

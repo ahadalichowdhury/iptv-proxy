@@ -3,7 +3,7 @@ package proxy
 import "testing"
 
 func TestRewriteDashManifestInjectsBaseURL(t *testing.T) {
-	engine := NewEngine(10, "http://127.0.0.1:8080")
+	engine := NewEngine(10, "http://127.0.0.1:8080", "")
 	body := []byte(`<?xml version="1.0"?><MPD type="dynamic"><Period id="0"><AdaptationSet><Representation><SegmentTemplate media="v_$Time$.m4s" initialization="y.m4s"/></Representation></AdaptationSet></Period></MPD>`)
 
 	rewritten, err := engine.rewriteDashManifest(

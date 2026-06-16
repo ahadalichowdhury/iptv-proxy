@@ -51,6 +51,7 @@ type Engine struct {
 	cache            sync.Map
 	maxConcurrent    int
 	proxyBase        string
+	tokenSecret      string
 	manifestTimeout  time.Duration
 	streamTimeout    time.Duration
 	maxManifestSize  int64
@@ -58,7 +59,7 @@ type Engine struct {
 }
 
 // NewEngine creates a proxy engine with the given concurrency limit.
-func NewEngine(maxConcurrent int, proxyBase string) *Engine {
+func NewEngine(maxConcurrent int, proxyBase, tokenSecret string) *Engine {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMaxConcurrent
 	}
@@ -80,6 +81,7 @@ func NewEngine(maxConcurrent int, proxyBase string) *Engine {
 		},
 		maxConcurrent:   maxConcurrent,
 		proxyBase:       strings.TrimRight(proxyBase, "/"),
+		tokenSecret:     strings.TrimSpace(tokenSecret),
 		manifestTimeout: defaultManifestTimeout,
 		streamTimeout:   0, // 0 = no deadline beyond client disconnect for segment bodies
 		maxManifestSize: defaultMaxManifestSize,
@@ -124,17 +126,14 @@ func (e *Engine) HandleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleStreamGet(w http.ResponseWriter, r *http.Request) {
-
-	targetURL := strings.TrimSpace(r.URL.Query().Get("url"))
-	if targetURL == "" {
-		http.Error(w, "missing required query parameter: url", http.StatusBadRequest)
+	targetURL, auth, err := e.resolveTarget(r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, utils.ErrPlayTokenExpired) {
+			status = http.StatusUnauthorized
+		}
+		http.Error(w, err.Error(), status)
 		return
-	}
-
-	auth := r.URL.Query().Get("auth")
-	if pipeURL, pipeAuth := utils.ParseStreamSource(targetURL); pipeAuth != "" || pipeURL != targetURL {
-		targetURL = pipeURL
-		auth = utils.MergeAuth(pipeAuth, auth)
 	}
 
 	if _, err := url.ParseRequestURI(targetURL); err != nil {
@@ -167,16 +166,14 @@ func (e *Engine) handleStreamGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Engine) handleStreamPost(w http.ResponseWriter, r *http.Request) {
-	targetURL := strings.TrimSpace(r.URL.Query().Get("url"))
-	if targetURL == "" {
-		http.Error(w, "missing required query parameter: url", http.StatusBadRequest)
+	targetURL, auth, err := e.resolveTarget(r)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, utils.ErrPlayTokenExpired) {
+			status = http.StatusUnauthorized
+		}
+		http.Error(w, err.Error(), status)
 		return
-	}
-
-	auth := r.URL.Query().Get("auth")
-	if pipeURL, pipeAuth := utils.ParseStreamSource(targetURL); pipeAuth != "" || pipeURL != targetURL {
-		targetURL = pipeURL
-		auth = utils.MergeAuth(pipeAuth, auth)
 	}
 
 	if _, err := url.ParseRequestURI(targetURL); err != nil {
@@ -196,6 +193,28 @@ func (e *Engine) handleStreamPost(w http.ResponseWriter, r *http.Request) {
 	defer e.release()
 
 	e.proxyPost(w, r, targetURL, auth)
+}
+
+func (e *Engine) resolveTarget(r *http.Request) (targetURL, auth string, err error) {
+	if token := strings.TrimSpace(r.URL.Query().Get("t")); token != "" {
+		if e.tokenSecret == "" {
+			return "", "", fmt.Errorf("opaque play tokens are not enabled")
+		}
+		return utils.DecryptPlayToken(e.tokenSecret, token)
+	}
+
+	targetURL = strings.TrimSpace(r.URL.Query().Get("url"))
+	if targetURL == "" {
+		return "", "", fmt.Errorf("missing required query parameter: url or t")
+	}
+
+	auth = r.URL.Query().Get("auth")
+	if pipeURL, pipeAuth := utils.ParseStreamSource(targetURL); pipeAuth != "" || pipeURL != targetURL {
+		targetURL = pipeURL
+		auth = utils.MergeAuth(pipeAuth, auth)
+	}
+
+	return targetURL, auth, nil
 }
 
 func (e *Engine) proxyPost(w http.ResponseWriter, r *http.Request, targetURL, auth string) {
@@ -691,7 +710,7 @@ func (e *Engine) rewriteManifest(body []byte, baseURL, auth string) ([]byte, err
 				continue
 			}
 			if strings.Contains(strings.ToUpper(trimmed), "URI=") {
-				out.WriteString(rewriteTagURI(line, base, e.proxyBase, auth))
+				out.WriteString(e.rewriteTagURI(line, base, auth))
 			} else {
 				out.WriteString(line)
 			}
@@ -750,7 +769,7 @@ func skipUntilNewline(r *bufio.Reader) error {
 	}
 }
 
-func rewriteTagURI(line string, base *url.URL, proxyBase, auth string) string {
+func (e *Engine) rewriteTagURI(line string, base *url.URL, auth string) string {
 	const key = "URI=\""
 	upper := strings.ToUpper(line)
 	idx := strings.Index(upper, key)
@@ -766,10 +785,7 @@ func rewriteTagURI(line string, base *url.URL, proxyBase, auth string) string {
 
 	uri := line[start : start+end]
 	resolved := resolveReference(base, uri)
-	proxied := fmt.Sprintf("%s/proxy?url=%s", strings.TrimRight(proxyBase, "/"), url.QueryEscape(resolved))
-	if auth != "" {
-		proxied += "&auth=" + url.QueryEscape(auth)
-	}
+	proxied := e.proxyURL(resolved, auth)
 
 	return line[:start] + proxied + line[start+end:]
 }
@@ -783,6 +799,13 @@ func resolveReference(base *url.URL, ref string) string {
 }
 
 func (e *Engine) proxyURL(target, auth string) string {
+	if e.tokenSecret != "" {
+		token, err := utils.EncryptPlayToken(e.tokenSecret, target, auth, 6*time.Hour)
+		if err == nil {
+			return fmt.Sprintf("%s/proxy?t=%s", e.proxyBase, url.QueryEscape(token))
+		}
+	}
+
 	out := fmt.Sprintf("%s/proxy?url=%s", e.proxyBase, url.QueryEscape(target))
 	if auth != "" {
 		out += "&auth=" + url.QueryEscape(auth)

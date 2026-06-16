@@ -33,7 +33,7 @@ func TestUpstreamFollowsRedirectWithCookieJar(t *testing.T) {
 	}))
 	defer gateServer.Close()
 
-	engine := NewEngine(8, "http://127.0.0.1:8080/proxy")
+	engine := NewEngine(8, "http://127.0.0.1:8080/proxy", "")
 	req := httptest.NewRequest(http.MethodGet, "http://proxy.local/proxy?url="+gateServer.URL, nil)
 
 	resp, cancel, err := engine.doUpstream(req, gateServer.URL, "", upstreamStream)
@@ -130,7 +130,7 @@ func TestIsHLSManifest(t *testing.T) {
 }
 
 func TestHandleStreamPostRejectsDataURL(t *testing.T) {
-	engine := NewEngine(8, "http://127.0.0.1:8080/proxy")
+	engine := NewEngine(8, "http://127.0.0.1:8080/proxy", "")
 	dataURL := "data:application/json;base64,eyJrZXlzIjpbXX0="
 	req := httptest.NewRequest(
 		http.MethodPost,

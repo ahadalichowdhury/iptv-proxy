@@ -23,7 +23,7 @@ func main() {
 		proxyBase = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
 
-	engine := proxy.NewEngine(maxConcurrent, proxyBase)
+	engine := proxy.NewEngine(maxConcurrent, proxyBase, os.Getenv("PROXY_TOKEN_SECRET"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/proxy", engine.HandleStream)
