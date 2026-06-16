@@ -833,6 +833,11 @@ func (e *Engine) MaxConcurrent() int {
 	return e.maxConcurrent
 }
 
+// PlayTokensEnabled reports whether opaque ?t= playback tokens are active.
+func (e *Engine) PlayTokensEnabled() bool {
+	return e.tokenSecret != ""
+}
+
 // manifestCacheTTL decides whether a rewritten manifest may be cached.
 // Live media playlists must never be cached — they gain new segments continuously.
 func manifestCacheTTL(body []byte) (time.Duration, bool) {

@@ -30,9 +30,10 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":          "ok",
-			"active_streams":  engine.ActiveStreams(),
-			"max_concurrent":  engine.MaxConcurrent(),
+			"status":              "ok",
+			"active_streams":      engine.ActiveStreams(),
+			"max_concurrent":      engine.MaxConcurrent(),
+			"play_tokens_enabled": engine.PlayTokensEnabled(),
 		})
 	})
 
