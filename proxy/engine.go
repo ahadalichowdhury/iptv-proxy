@@ -507,6 +507,14 @@ func (e *Engine) fetchUpstream(r *http.Request, targetURL, auth string) ([]byte,
 		return nil, 0, sessionAuth, finalURL, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
 	}
 
+	body, err = decompressIfGzip(body, resp.Header.Get("Content-Encoding"))
+	if err != nil {
+		return nil, 0, sessionAuth, finalURL, err
+	}
+	if int64(len(body)) > e.maxManifestSize {
+		return nil, 0, sessionAuth, finalURL, fmt.Errorf("manifest body exceeds limit %d bytes", e.maxManifestSize)
+	}
+
 	return body, resp.StatusCode, sessionAuth, finalURL, nil
 }
 

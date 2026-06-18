@@ -21,6 +21,25 @@ func TestRewriteDashManifestInjectsBaseURL(t *testing.T) {
 	}
 }
 
+func TestRewriteDashManifestResolvesRelativeBaseURL(t *testing.T) {
+	engine := NewEngine(10, "http://127.0.0.1:8080", "")
+	body := []byte(`<?xml version="1.0"?><MPD type="dynamic"><Period id="1"><BaseURL>dash/</BaseURL><AdaptationSet/></Period></MPD>`)
+
+	rewritten, err := engine.rewriteDashManifest(
+		body,
+		"https://cdn.example.com/live/stream.isml/dash/.mpd",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("rewriteDashManifest() error = %v", err)
+	}
+
+	content := string(rewritten)
+	if !stringsContains(content, "<BaseURL>https://cdn.example.com/live/stream.isml/dash/dash/</BaseURL>") {
+		t.Fatalf("expected resolved BaseURL, got %q", content)
+	}
+}
+
 func TestIsValidDashManifest(t *testing.T) {
 	if !isValidDashManifest([]byte(`<MPD type="dynamic"></MPD>`)) {
 		t.Fatal("expected valid dash manifest")

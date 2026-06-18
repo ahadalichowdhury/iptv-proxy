@@ -10,6 +10,7 @@ import (
 
 var (
 	dashLocationPattern   = regexp.MustCompile(`(?i)<Location[^>]*>([^<]+)</Location>`)
+	dashBaseURLPattern    = regexp.MustCompile(`(?i)(<BaseURL[^>]*>)([^<]+)(</BaseURL>)`)
 	dashPeriodOpenPattern = regexp.MustCompile(`(?i)(<Period\b[^>]*>)`)
 )
 
@@ -64,6 +65,20 @@ func (e *Engine) rewriteDashManifest(body []byte, manifestURL, auth string) ([]b
 			return match
 		}
 		return strings.Replace(match, sub[1], e.proxyURL(resolved, auth), 1)
+	})
+
+	// Relative BaseURL values (e.g. "dash/") resolve against the proxied manifest URL in
+	// the browser, sending segment requests to the proxy host instead of the CDN.
+	content = dashBaseURLPattern.ReplaceAllStringFunc(content, func(match string) string {
+		sub := dashBaseURLPattern.FindStringSubmatch(match)
+		if len(sub) < 4 {
+			return match
+		}
+		resolved, ok := resolveDashReference(manifestURL, strings.TrimSpace(sub[2]))
+		if !ok {
+			return match
+		}
+		return sub[1] + escapeXML(resolved) + sub[3]
 	})
 
 	if !strings.Contains(strings.ToLower(content), "<baseurl") {
