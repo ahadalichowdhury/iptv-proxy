@@ -32,7 +32,7 @@ func main() {
 		var err error
 		dataStore, err = store.Open(ctx)
 		if err != nil {
-			log.Fatalf("mongodb store error: %v", err)
+			log.Printf("mongodb store error: %v — channel data API disabled", err)
 		}
 	} else {
 		log.Println("MONGODB_URI not set — channel data API disabled")
