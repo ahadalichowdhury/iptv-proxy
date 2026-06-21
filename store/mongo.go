@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -80,9 +81,9 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 	defer cancel()
 
 	streamIndexes := []mongo.IndexModel{
-		{Keys: map[string]int{"createdAt": -1}},
-		{Keys: map[string]int{"sourceId": 1}},
-		{Keys: map[string]int{"channelKey": 1, "sourceId": 1}},
+		{Keys: bson.D{{Key: "createdAt", Value: -1}}},
+		{Keys: bson.D{{Key: "sourceId", Value: 1}}},
+		{Keys: bson.D{{Key: "channelKey", Value: 1}, {Key: "sourceId", Value: 1}}},
 	}
 	if _, err := s.db.Collection("streams").Indexes().CreateMany(indexCtx, streamIndexes); err != nil {
 		return err
@@ -90,7 +91,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 
 	sourceIndexes := []mongo.IndexModel{
 		{
-			Keys:    map[string]int{"sourceUrl": 1},
+			Keys:    bson.D{{Key: "sourceUrl", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 	}
@@ -99,7 +100,7 @@ func (s *Store) ensureIndexes(ctx context.Context) error {
 	}
 
 	presenceIndexes := []mongo.IndexModel{
-		{Keys: map[string]int{"lastSeen": 1}},
+		{Keys: bson.D{{Key: "lastSeen", Value: 1}}},
 	}
 	_, err := s.db.Collection("presence_sessions").Indexes().CreateMany(indexCtx, presenceIndexes)
 	return err
