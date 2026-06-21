@@ -9,10 +9,13 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"tv-proxy-go/api"
 	"tv-proxy-go/proxy"
+	"tv-proxy-go/store"
 )
 
 func main() {
@@ -23,10 +26,25 @@ func main() {
 		proxyBase = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
 
+	ctx := context.Background()
+	var dataStore *store.Store
+	if strings.TrimSpace(os.Getenv("MONGODB_URI")) != "" {
+		var err error
+		dataStore, err = store.Open(ctx)
+		if err != nil {
+			log.Fatalf("mongodb store error: %v", err)
+		}
+	} else {
+		log.Println("MONGODB_URI not set — channel data API disabled")
+	}
+
 	engine := proxy.NewEngine(maxConcurrent, proxyBase, os.Getenv("PROXY_TOKEN_SECRET"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/proxy", engine.HandleStream)
+	if dataStore != nil {
+		api.NewDataHandler(dataStore).Register(mux)
+	}
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -34,6 +52,7 @@ func main() {
 			"active_streams":      engine.ActiveStreams(),
 			"max_concurrent":      engine.MaxConcurrent(),
 			"play_tokens_enabled": engine.PlayTokensEnabled(),
+			"data_api_enabled":    dataStore != nil,
 		})
 	})
 
@@ -58,20 +77,25 @@ func main() {
 	<-stop
 
 	log.Println("shutting down gracefully...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown error: %v", err)
 	}
 	engine.Shutdown()
+	if dataStore != nil {
+		if err := dataStore.Close(shutdownCtx); err != nil {
+			log.Printf("mongodb disconnect error: %v", err)
+		}
+	}
 	log.Println("server stopped")
 }
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Range, Content-Type, Authorization")
 		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type")
 
